@@ -2,7 +2,7 @@
     "name": "twitter-bot-vercel",
     "version": "1.0.0",
     "dependencies": {
-      "twitter-api-v2": "^1.15.0"
+        "@vercel/node": "^5.1.16",
+        "twitter-api-v2": "^1.15.0"
     }
-  }
-  
+}
