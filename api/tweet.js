@@ -43,7 +43,7 @@ export default async function handler(req, res) {
 
     try {
       // Convert video to Twitter-compatible format using ffmpeg
-      const ffmpegCmd = `ffmpeg -i "${inputPath}" -vf "scale=1280:-2" -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p -preset fast -b:v 2500k -c:a aac -b:a 128k -ar 44100 -movflags +faststart "${outputPath}"`;
+      const ffmpegCmd = `ffmpeg -i "${inputPath}" -t 139 -vf "scale=1280:720" -r 30 -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p -preset fast -b:v 2500k -c:a aac -b:a 128k -ar 44100 -movflags +faststart "${outputPath}"`;
       console.log('Running FFmpeg:', ffmpegCmd);
       await execPromise(ffmpegCmd);
 
