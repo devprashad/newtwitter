@@ -2,14 +2,12 @@ import { TwitterApi } from 'twitter-api-v2';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
 import util from 'util';
-
-const execPromise = util.promisify(exec);
+import sleep from 'util-promisify-timeout'; // Custom wait helper
 
 export const config = {
   api: {
-    bodyParser: false, // Required for file uploads
+    bodyParser: false,
   },
 };
 
@@ -36,57 +34,69 @@ export default async function handler(req, res) {
       accessToken,
       accessSecret,
     });
+
     const rwClient = twitterClient.readWrite;
 
-    const inputPath = file.path;
-    const outputPath = `/tmp/converted_${Date.now()}.mp4`;
-
     try {
-      // Convert video to Twitter-compatible format using ffmpeg
-      const ffmpegCmd = `ffmpeg -i "${inputPath}" -t 139 -vf "scale=1280:720" -r 30 -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p -preset fast -b:v 2500k -c:a aac -b:a 128k -ar 44100 -movflags +faststart "${outputPath}"`;
-      console.log('Running FFmpeg:', ffmpegCmd);
-      await execPromise(ffmpegCmd);
-
-      const mediaData = fs.readFileSync(outputPath);
+      const mediaData = fs.readFileSync(file.path);
       const mediaSize = mediaData.length;
-      const mediaType = 'video/mp4';
+      const mediaType = file.mimetype;
 
-      // INIT
-      const initResponse = await rwClient.v1.mediaUploadInit({
+      // Step 1: INIT
+      const initResp = await rwClient.v1.mediaUploadInit({
         command: 'INIT',
         total_bytes: mediaSize,
         media_type: mediaType,
         media_category: 'tweet_video',
       });
 
-      const mediaId = initResponse.media_id_string;
+      const mediaId = initResp.media_id_string;
 
-      // APPEND in chunks
+      // Step 2: APPEND chunks
       const chunkSize = 5 * 1024 * 1024;
       for (let i = 0; i < mediaSize; i += chunkSize) {
         const chunk = mediaData.slice(i, i + chunkSize);
         await rwClient.v1.mediaUploadAppend(mediaId, chunk, i / chunkSize);
       }
 
-      // FINALIZE
+      // Step 3: FINALIZE
       await rwClient.v1.mediaUploadFinalize(mediaId);
 
-      // TWEET
+      // Step 4: Poll for processing status
+      let processingInfo;
+      let attempts = 0;
+
+      do {
+        const statusResp = await rwClient.v1.mediaInfo(mediaId);
+        processingInfo = statusResp.processing_info;
+
+        if (!processingInfo || processingInfo.state === 'succeeded') {
+          break;
+        }
+
+        if (processingInfo.state === 'failed') {
+          throw new Error(`Media processing failed: ${processingInfo.error.name}`);
+        }
+
+        const checkAfter = processingInfo.check_after_secs || 5;
+        await sleep(checkAfter * 1000);
+        attempts++;
+
+      } while (attempts < 10);
+
+      // Step 5: Post Tweet
       await rwClient.v2.tweet({
         text,
         media: { media_ids: [mediaId] },
       });
 
       fs.unlinkSync(file.path);
-      fs.unlinkSync(outputPath);
+      return res.status(200).json({ success: true, message: 'Tweet posted with video!' });
 
-      res.status(200).json({ success: true, message: 'Tweet posted with converted video!' });
-
-    } catch (err) {
-      console.error('Upload Error:', err);
-      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-      res.status(500).json({ error: 'Video upload failed', details: err.message });
+    } catch (error) {
+      console.error('Final Error:', error);
+      if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      return res.status(500).json({ error: 'Tweet failed', details: error.message });
     }
   });
 }
