@@ -2,6 +2,10 @@ import { TwitterApi } from 'twitter-api-v2';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
+import { exec } from 'child_process';
+import util from 'util';
+
+const execPromise = util.promisify(exec);
 
 export const config = {
   api: {
@@ -34,12 +38,20 @@ export default async function handler(req, res) {
     });
     const rwClient = twitterClient.readWrite;
 
-    const mediaData = fs.readFileSync(file.path);
-    const mediaSize = mediaData.length;
-    const mediaType = file.mimetype;
+    const inputPath = file.path;
+    const outputPath = `/tmp/converted_${Date.now()}.mp4`;
 
     try {
-      // Step 1: INIT
+      // Convert video to Twitter-compatible format using ffmpeg
+      const ffmpegCmd = `ffmpeg -i "${inputPath}" -vf "scale=1280:-2" -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p -preset fast -b:v 2500k -c:a aac -b:a 128k -ar 44100 -movflags +faststart "${outputPath}"`;
+      console.log('Running FFmpeg:', ffmpegCmd);
+      await execPromise(ffmpegCmd);
+
+      const mediaData = fs.readFileSync(outputPath);
+      const mediaSize = mediaData.length;
+      const mediaType = 'video/mp4';
+
+      // INIT
       const initResponse = await rwClient.v1.mediaUploadInit({
         command: 'INIT',
         total_bytes: mediaSize,
@@ -49,28 +61,31 @@ export default async function handler(req, res) {
 
       const mediaId = initResponse.media_id_string;
 
-      // Step 2: APPEND chunks (5MB max)
+      // APPEND in chunks
       const chunkSize = 5 * 1024 * 1024;
       for (let i = 0; i < mediaSize; i += chunkSize) {
         const chunk = mediaData.slice(i, i + chunkSize);
         await rwClient.v1.mediaUploadAppend(mediaId, chunk, i / chunkSize);
       }
 
-      // Step 3: FINALIZE
+      // FINALIZE
       await rwClient.v1.mediaUploadFinalize(mediaId);
 
-      // Post tweet
+      // TWEET
       await rwClient.v2.tweet({
         text,
         media: { media_ids: [mediaId] },
       });
 
-      fs.unlinkSync(file.path); // Clean up
-      res.status(200).json({ success: true, message: 'Tweet posted with video!' });
+      fs.unlinkSync(file.path);
+      fs.unlinkSync(outputPath);
+
+      res.status(200).json({ success: true, message: 'Tweet posted with converted video!' });
 
     } catch (err) {
       console.error('Upload Error:', err);
-      fs.unlinkSync(file.path);
+      if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
       res.status(500).json({ error: 'Video upload failed', details: err.message });
     }
   });
