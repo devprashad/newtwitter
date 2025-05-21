@@ -1,9 +1,7 @@
 import { TwitterApi } from 'twitter-api-v2';
 import multer from 'multer';
 import fs from 'fs';
-import path from 'path';
-import util from 'util';
-import sleep from 'util-promisify-timeout'; // Custom wait helper
+import sleep from 'util-promisify-timeout'; // For polling
 
 export const config = {
   api: {
@@ -24,8 +22,8 @@ export default async function handler(req, res) {
     const { text, appKey, appSecret, accessToken, accessSecret } = req.body;
     const file = req.file;
 
-    if (!text || !file || !appKey || !appSecret || !accessToken || !accessSecret) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!appKey || !appSecret || !accessToken || !accessSecret) {
+      return res.status(400).json({ error: 'Missing Twitter credentials' });
     }
 
     const twitterClient = new TwitterApi({
@@ -36,67 +34,85 @@ export default async function handler(req, res) {
     });
 
     const rwClient = twitterClient.readWrite;
+    let mediaId;
 
     try {
-      const mediaData = fs.readFileSync(file.path);
-      const mediaSize = mediaData.length;
-      const mediaType = file.mimetype;
+      // === Upload media if present ===
+      if (file) {
+        const mediaData = fs.readFileSync(file.path);
+        const mediaSize = mediaData.length;
+        const mediaType = file.mimetype;
 
-      // Step 1: INIT
-      const initResp = await rwClient.v1.mediaUploadInit({
-        command: 'INIT',
-        total_bytes: mediaSize,
-        media_type: mediaType,
-        media_category: 'tweet_video',
-      });
+        // INIT
+        const initResp = await rwClient.v1.mediaUploadInit({
+          command: 'INIT',
+          total_bytes: mediaSize,
+          media_type: mediaType,
+          media_category: 'tweet_video',
+        });
 
-      const mediaId = initResp.media_id_string;
+        mediaId = initResp.media_id_string;
 
-      // Step 2: APPEND chunks
-      const chunkSize = 5 * 1024 * 1024;
-      for (let i = 0; i < mediaSize; i += chunkSize) {
-        const chunk = mediaData.slice(i, i + chunkSize);
-        await rwClient.v1.mediaUploadAppend(mediaId, chunk, i / chunkSize);
+        // APPEND
+        const chunkSize = 5 * 1024 * 1024;
+        for (let i = 0; i < mediaSize; i += chunkSize) {
+          const chunk = mediaData.slice(i, i + chunkSize);
+          await rwClient.v1.mediaUploadAppend(mediaId, chunk, i / chunkSize);
+        }
+
+        // FINALIZE
+        await rwClient.v1.mediaUploadFinalize(mediaId);
+
+        // POLL
+        let processingInfo;
+        let attempts = 0;
+        do {
+          const statusResp = await rwClient.v1.mediaInfo(mediaId);
+          processingInfo = statusResp.processing_info;
+
+          if (!processingInfo || processingInfo.state === 'succeeded') break;
+          if (processingInfo.state === 'failed') {
+            throw new Error(`Media processing failed: ${processingInfo.error.name}`);
+          }
+
+          const wait = processingInfo.check_after_secs || 5;
+          await sleep(wait * 1000);
+          attempts++;
+        } while (attempts < 10);
+
+        fs.unlinkSync(file.path);
       }
 
-      // Step 3: FINALIZE
-      await rwClient.v1.mediaUploadFinalize(mediaId);
-
-      // Step 4: Poll for processing status
-      let processingInfo;
-      let attempts = 0;
-
-      do {
-        const statusResp = await rwClient.v1.mediaInfo(mediaId);
-        processingInfo = statusResp.processing_info;
-
-        if (!processingInfo || processingInfo.state === 'succeeded') {
-          break;
+      // === Handle tweet ===
+      if (text) {
+        const tweetPayload = { text };
+        if (mediaId) {
+          tweetPayload.media = { media_ids: [mediaId] };
         }
 
-        if (processingInfo.state === 'failed') {
-          throw new Error(`Media processing failed: ${processingInfo.error.name}`);
-        }
+        const tweet = await rwClient.v2.tweet(tweetPayload);
+        return res.status(200).json({
+          success: true,
+          message: 'Tweet posted!',
+          tweet_url: `https://twitter.com/user/status/${tweet.data.id}`,
+        });
+      }
 
-        const checkAfter = processingInfo.check_after_secs || 5;
-        await sleep(checkAfter * 1000);
-        attempts++;
+      // === If only media uploaded ===
+      if (mediaId && !text) {
+        return res.status(200).json({
+          success: true,
+          message: 'Media uploaded successfully!',
+          media_id: mediaId,
+        });
+      }
 
-      } while (attempts < 10);
-
-      // Step 5: Post Tweet
-      await rwClient.v2.tweet({
-        text,
-        media: { media_ids: [mediaId] },
-      });
-
-      fs.unlinkSync(file.path);
-      return res.status(200).json({ success: true, message: 'Tweet posted with video!' });
+      return res.status(400).json({ error: 'Nothing to post (no text or media)' });
 
     } catch (error) {
-      console.error('Final Error:', error);
+      console.error('Error:', error);
       if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
-      return res.status(500).json({ error: 'Tweet failed', details: error.message });
+      return res.status(500).json({ error: 'Operation failed', details: error.message });
     }
   });
 }
