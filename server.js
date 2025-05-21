@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
@@ -9,21 +8,21 @@ const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 app.use(cors());
-app.use(express.json());
 
 app.post('/api/tweet', upload.single('media'), async (req, res) => {
+  const { text, appKey, appSecret, accessToken, accessSecret } = req.body;
+  const file = req.file;
+
+  if (!appKey || !appSecret || !accessToken || !accessSecret) {
+    if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    return res.status(400).json({ error: 'Missing required Twitter credentials' });
+  }
+
   try {
-    const { text, appKey, appSecret, accessToken, accessSecret } = req.body;
-    const file = req.file;
-
-    if (!appKey || !appSecret || !accessToken || !accessSecret) {
-      return res.status(400).json({ error: 'Missing required Twitter credentials' });
-    }
-
     const twitterClient = new TwitterApi({ appKey, appSecret, accessToken, accessSecret });
     const rwClient = twitterClient.readWrite;
 
-    let mediaId;
+    let mediaId = null;
 
     if (file) {
       const allowedMimeTypes = ['image/jpeg', 'image/png', 'video/mp4'];
@@ -33,34 +32,30 @@ app.post('/api/tweet', upload.single('media'), async (req, res) => {
       }
 
       const mediaData = fs.readFileSync(file.path);
+      const uploadOptions = { mimeType: file.mimetype };
 
-      // Use target: 'tweet' for video to trigger chunked upload
-      const uploadOptions = {
-        mimeType: file.mimetype,
-      };
-
+      // Trigger chunked upload for videos
       if (file.mimetype.startsWith('video/')) {
         uploadOptions.target = 'tweet';
       }
 
       mediaId = await rwClient.v1.uploadMedia(mediaData, uploadOptions);
-
-      fs.unlinkSync(file.path); // delete temp file after upload
+      fs.unlinkSync(file.path); // cleanup
     }
 
-    const tweetPayload = { text };
+    const tweetPayload = text ? { text } : {};
     if (mediaId) {
       tweetPayload.media = { media_ids: [mediaId] };
     }
 
-    await rwClient.v2.tweet(tweetPayload);
-
-    res.json({ success: true, message: 'Tweet posted!' });
+    const result = await rwClient.v2.tweet(tweetPayload);
+    res.json({ success: true, message: 'Tweet posted!', tweetId: result.data?.id });
 
   } catch (err) {
-    console.error('Error:', err);
-    if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-    res.status(500).json({ error: 'Failed to tweet', details: err.message });
+    console.error('Error posting tweet:', err);
+    if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+    const status = err.code === 403 ? 403 : 500;
+    res.status(status).json({ error: 'Failed to tweet', details: err.message });
   }
 });
 
